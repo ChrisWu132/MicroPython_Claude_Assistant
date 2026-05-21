@@ -1,0 +1,6 @@
+{
+  "name": "claude-buddy-bridge",
+  "version": "0.1.0",
+  "description": "Claude Buddy hardware desktop pet — Codex CLI hooks bridge.",
+  "hooks": "./hooks/hooks-codex.json"
+}

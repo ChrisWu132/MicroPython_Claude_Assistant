@@ -1,0 +1,12 @@
+{
+  "name": "claude-buddy",
+  "interface": { "displayName": "Claude Buddy" },
+  "plugins": [
+    {
+      "name": "claude-buddy-bridge",
+      "source": { "source": "local", "path": "./plugins/claude-buddy-bridge" },
+      "policy": { "installation": "AVAILABLE" },
+      "category": "Hardware"
+    }
+  ]
+}

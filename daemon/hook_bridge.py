@@ -398,9 +398,19 @@ def main():
         print(json.dumps({}))
         return
 
-    hook = event.get("hook_event_name", "")
-    normalize = NORMALIZERS.get(hook, _normalize_fallback)
-    envelope = normalize(event)
+    # Auto-route by source: Codex 0.130+ 在每个 hook payload 都注入 "model" 字段，
+    # Claude Code 不带。codex_normalizers 输出跟 CC 同形状的 v2 envelope，
+    # daemon 仅 dispatch 在 event.kind 上，不区分来源。详见 codex_normalizers.py 顶注。
+    if "model" in event:
+        try:
+            from .codex_normalizers import normalize as _codex_normalize
+        except ImportError:
+            from codex_normalizers import normalize as _codex_normalize
+        envelope = _codex_normalize(event)
+    else:
+        hook = event.get("hook_event_name", "")
+        normalize = NORMALIZERS.get(hook, _normalize_fallback)
+        envelope = normalize(event)
 
     # v5: 所有事件推送到 daemon，让设备显示状态
     # 不干预审批流程，始终返回 {}
