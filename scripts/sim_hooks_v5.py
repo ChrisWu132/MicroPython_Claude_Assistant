@@ -31,7 +31,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 FIXTURE_DIR = os.path.join(ROOT, "tests", "fixtures", "probe_samples")
 HOOK_BRIDGE = os.path.join(ROOT, "daemon", "hook_bridge.py")
 BLE_DAEMON   = os.path.join(ROOT, "daemon", "ble_daemon.py")
-HOST, PORT   = "127.0.0.1", 57320
+HOST, PORT   = "127.0.0.1", int(os.environ.get("CLAUDE_BUDDY_PORT", "57320"))
 
 # ── 基本测试序列 ──────────────────────────────────────────
 # 验证 v5 核心功能：状态推送、无审批等待

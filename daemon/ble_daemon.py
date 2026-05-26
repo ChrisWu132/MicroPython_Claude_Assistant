@@ -42,9 +42,9 @@ import time
 from typing import Optional
 
 try:
-    from .transport import BleTransport
+    from .transport import BleTransport, TcpFanoutTransport
 except ImportError:  # 直接 `python daemon/ble_daemon.py` 跑时
-    from transport import BleTransport
+    from transport import BleTransport, TcpFanoutTransport
 
 HOST = "127.0.0.1"
 # CLAUDE_BUDDY_PORT 让 e2e 测试用临时端口避开生产 daemon。生产默认 57320。
@@ -57,6 +57,7 @@ COMPLETED_HOLD_S = 2.0         # completed=True 持续秒数 (覆盖 CELEBRATE 3
 DIZZY_HOLD_S = 3.0             # tool_error / task_error msg="error" 持续秒数
 SESSION_ACTIVE_TIMEOUT_S = 10.0  # 超过此时间无活动的 IDLE session 不纳入 wire
 SESSION_CLEANUP_S = 10.0         # 超过此时间清理 session 对象
+MAX_SESSIONS = 5                 # device 端 slot 上限（与 device/config.py 对齐）
 
 # 设备 wire msg 字段值
 MSG_ERROR = "error"
@@ -87,12 +88,20 @@ class _Session:
 _sessions: dict = {}   # session_id → _Session
 _dirty = False         # 全局 dirty 标志（pusher 用）
 
+# slot 持久映射：list 索引 = device 端 slot，值 = 占用该 slot 的 session_id（None 表示空槽）
+# 同一 sid 永远绑定到首次分配的 slot 直到 _release_slot；这样 wire 里的 slot 字段
+# 跨 cleanup→重连保持稳定，解决 issue #6 的槽位漂移与 history 误清。
+_slot_assignments: list = [None] * MAX_SESSIONS
+
 # ── stub 模式 ─────────────────────────────────────────────
 _stub = False
 _force_offline = False  # --offline 标志：强制 device_online=False，覆盖 stub 的在线假设
+_tcp_fanout = False     # --tcp-fanout 标志：是否启用 TCP fanout
+_tcp_port = 57321       # --tcp-port 标志：TCP fanout 监听端口
 
 # ── Transport ─────────────────────────────────────────────
 _transport: Optional[BleTransport] = None
+_tcp_transport: Optional[TcpFanoutTransport] = None
 
 # ── 业务层全局 ────────────────────────────────────────────
 _lock = None
@@ -100,15 +109,19 @@ _last_pushed_wire = None       # 最后推送的 wire（pusher 用，防止重�
 
 
 # ── BLE 回调（业务层处理） ────────────────────────────────────
-def _on_transport_connect():
-    """BLE 重连成功：有活跃 session 时触发状态推送。"""
-    print("[daemon] connected" if _transport.connected() else "")
+def _on_transport_connect(label: str = "transport"):
+    """transport 连上：有活跃 session 时触发状态推送。
+
+    BLE 重连或 TCP fanout 有新 client 进来都走这里——任一 transport 上线都
+    应该让 daemon 把当前状态推一帧出去，确保新 sink 收到最新 wire。
+    """
+    print(f"[daemon] {label} connected")
     if _sessions:
         _mark_dirty()
 
 
-def _on_transport_disconnect():
-    print("[daemon] disconnected, will reconnect...")
+def _on_transport_disconnect(label: str = "transport"):
+    print(f"[daemon] {label} disconnected, will reconnect...")
 
 
 async def _send(payload: dict) -> bool:
@@ -126,10 +139,17 @@ async def _send(payload: dict) -> bool:
     ``last_pushed_wire``——否则 BLE 重连后状态相同会被 dedup 误吞，
     彻底修复 §A-4 commit message 里那个"走出房间回来桌宠永远不动"场景。
     """
+    # TCP fanout（best-effort，永远不影响 BLE 的 dedup 判定）
+    if _tcp_transport is not None:
+        try:
+            await _tcp_transport.send(payload)
+        except Exception as e:
+            print(f"[tcp-send] failed: {type(e).__name__}: {e}")
+
     if _stub:
         print(f"[stub-send] t={time.time():.3f} {json.dumps(payload, ensure_ascii=False)}")
         return True
-    if not _transport.connected():
+    if _transport is None or not _transport.connected():
         print(f"[send] skipped (not connected): {payload}")
         return False
     try:
@@ -154,6 +174,39 @@ def _get_current_category(sess: _Session) -> str:
     return ""
 
 
+# ── slot 持久映射 helper ──────────────────────────────────────
+
+def _assign_slot(sid: str) -> int:
+    """为 sid 分配 slot：已有则复用；否则取第一个 None 位；满返回 -1。"""
+    for i, x in enumerate(_slot_assignments):
+        if x == sid:
+            return i
+    for i, x in enumerate(_slot_assignments):
+        if x is None:
+            _slot_assignments[i] = sid
+            print(f"[slot] sid={sid!r} assigned slot={i}")
+            return i
+    print(f"[slot] sid={sid!r} OVERFLOW (all {MAX_SESSIONS} slots in use)")
+    return -1
+
+
+def _release_slot(sid: str) -> None:
+    """释放 sid 持有的 slot（如果有）。"""
+    for i, x in enumerate(_slot_assignments):
+        if x == sid:
+            _slot_assignments[i] = None
+            print(f"[slot] sid={sid!r} released slot={i}")
+            return
+
+
+def _sid_to_slot(sid: str) -> int:
+    """查 sid 当前 slot，未分配返回 -1。"""
+    for i, x in enumerate(_slot_assignments):
+        if x == sid:
+            return i
+    return -1
+
+
 def _build_msg(sess: _Session) -> str:
     now = time.time()
     if sess.dizzy_until > now:
@@ -169,7 +222,7 @@ def _build_msg(sess: _Session) -> str:
 
 def _session_to_wire(sid: str, sess: _Session) -> dict:
     now = time.time()
-    result = {"n": sess.display_name or "?"}
+    result = {"n": sess.display_name or "?", "slot": _sid_to_slot(sid)}
 
     if sess.dizzy_until > now:
         result["s"] = "E"
@@ -271,6 +324,7 @@ def _retire_stale_waiting_sessions(current_sid: str, cwd: str) -> None:
             retired.append(sid)
     for sid in retired:
         del _sessions[sid]
+        _release_slot(sid)
     if retired:
         print(f"[session] retired stale waiting sessions: {retired}")
         _mark_dirty()
@@ -302,14 +356,20 @@ async def _pusher_tick(last_pushed_wire):
     now = time.time()
 
     # 清理长期无活动 session（turn_active 期间不清理，防止思考阶段状态丢失）
-    for sid in [k for k, s in list(_sessions.items())
-                if not s.tools
-                and not s.turn_active
-                and s.last_activity_ts > 0
-                and now - s.last_activity_ts > SESSION_CLEANUP_S
-                and s.completed_until <= now
-                and s.dizzy_until <= now]:
+    cleaned = [k for k, s in list(_sessions.items())
+               if not s.tools
+               and not s.turn_active
+               and s.last_activity_ts > 0
+               and now - s.last_activity_ts > SESSION_CLEANUP_S
+               and s.completed_until <= now
+               and s.dizzy_until <= now]
+    for sid in cleaned:
         del _sessions[sid]
+        _release_slot(sid)
+    if cleaned:
+        # sibling bug fix：cleanup 后必须 mark dirty 让 device 端立刻看到 session 消失，
+        # 否则 last_pushed_wire 滞留含已删除 session 直到下一个事件
+        _mark_dirty()
 
     # completed 到期标 dirty
     for sess in _sessions.values():
@@ -370,6 +430,7 @@ async def _handle_envelope(env: dict) -> dict:
     """根据 event.kind 改对应 session 的状态。返回给 hook_bridge 的 dict。"""
     session_id = env.get("generic", {}).get("session_id", "") or "default"
     sess = _sessions.setdefault(session_id, _Session())
+    _assign_slot(session_id)  # 首次分配会落到第一个 None；已有 sid 直接复用
 
     # 提取 cwd 并生成 display_name（首次）
     if not sess.display_name:
@@ -547,24 +608,31 @@ async def _handle_client(reader, writer):
 
 
 async def async_main():
-    global _lock, _transport
+    global _lock, _transport, _tcp_transport
     _lock = asyncio.Lock()
-    _transport = BleTransport()
     server = await asyncio.start_server(_handle_client, HOST, PORT)
-    print(f"[daemon] listening on {HOST}:{PORT}  stub={_stub}")
+    print(f"[daemon] listening on {HOST}:{PORT}  stub={_stub} tcp_fanout={_tcp_fanout}")
+
+    tasks = [server.serve_forever(), _pusher_task()]
+
+    if not _stub:
+        _transport = BleTransport()
+        tasks.append(_transport.start(
+            on_recv=lambda msg: None,
+            on_connect=lambda: _on_transport_connect("BLE"),
+            on_disconnect=lambda: _on_transport_disconnect("BLE"),
+        ))
+
+    if _tcp_fanout:
+        _tcp_transport = TcpFanoutTransport(host="127.0.0.1", port=_tcp_port)
+        tasks.append(_tcp_transport.start(
+            on_recv=lambda msg: None,
+            on_connect=lambda: _on_transport_connect("TCP-fanout"),
+            on_disconnect=lambda: _on_transport_disconnect("TCP-fanout"),
+        ))
+
     async with server:
-        if _stub:
-            await asyncio.gather(server.serve_forever(), _pusher_task())
-        else:
-            await asyncio.gather(
-                server.serve_forever(),
-                _transport.start(
-                    on_recv=lambda msg: None,
-                    on_connect=_on_transport_connect,
-                    on_disconnect=_on_transport_disconnect,
-                ),
-                _pusher_task(),
-            )
+        await asyncio.gather(*tasks)
 
 
 def main() -> None:
@@ -574,18 +642,26 @@ def main() -> None:
     ``async_main()``，由本函数 ``asyncio.run`` 包起来。直接 ``python daemon/ble_daemon.py``
     跑也走这里。
     """
-    global _stub, _force_offline
+    global _stub, _force_offline, _tcp_fanout, _tcp_port
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--stub", action="store_true",
                         help="跳过 BLE 连接, _send 改 stdout 打印用于 e2e 测试")
     parser.add_argument("--offline", action="store_true",
                         help="强制模拟设备离线（覆盖 stub 在线假设），用于离线审批测试")
+    parser.add_argument("--tcp-fanout", action="store_true",
+                        help="启用 TCP fanout，把 wire 同步广播到 127.0.0.1:<port>，"
+                             "供 scripts/virtual_device.py 等无硬件测试 sink 接收。"
+                             "可与 --stub 组合使用做纯软件长测")
+    parser.add_argument("--tcp-port", type=int, default=57321,
+                        help="TCP fanout 监听端口（默认 57321）")
     parser.add_argument("--log", type=str, default=None,
                         help="日志文件路径（默认：临时目录下的 ble_daemon.log）")
     args = parser.parse_args()
     _stub = args.stub
     _force_offline = args.offline
+    _tcp_fanout = args.tcp_fanout
+    _tcp_port = args.tcp_port
 
     import os
     import tempfile

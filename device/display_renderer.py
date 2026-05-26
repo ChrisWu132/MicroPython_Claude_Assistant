@@ -479,15 +479,24 @@ class DisplayRenderer:
     async def render(self, msg):
         if msg is None or isinstance(msg, dict):
             return
-        self._sessions = msg.sessions[:MAX_SESSIONS]
+        # v6：daemon 在 wire entry 里塞了 slot 字段，按 slot 派发；
+        # slot=-1（老 daemon 无 slot 或 daemon 端 overflow）视为不显示。
+        # 不再走 enumerate fallback —— v6 device 端要求新 daemon。
+        slot_table = [None] * MAX_SESSIONS
+        for sess in msg.sessions:
+            slot = getattr(sess, "slot", -1)
+            if 0 <= slot < MAX_SESSIONS:
+                slot_table[slot] = sess
+        self._sessions = slot_table  # 保存为按 slot 排好的 list，下游 _update_main 等也走 slot index
+
         for i in range(MAX_SESSIONS):
-            sess = self._sessions[i] if i < len(self._sessions) else None
+            sess = slot_table[i]
             self._update_tab(i, sess)
-            if sess:
+            if sess is not None:
                 self._update_history(i, sess)
 
-        # 状态跳变检测 → 触发语音
-        for sess in self._sessions:
+        # 状态跳变检测 → 触发语音（不依赖 slot，按 sess.name 跟踪）
+        for sess in msg.sessions:
             cur = _sess_state(sess)
             prev = self._prev_states.get(sess.name)
             if cur != prev:
@@ -514,7 +523,10 @@ class DisplayRenderer:
     # ── 主界面更新 ────────────────────────────────────────────
 
     def _update_main(self):
-        state = _dominant_state(self._sessions)
+        # v6 起 self._sessions 是 slot_table（长度 MAX_SESSIONS，空槽 None），
+        # 所有下游访问都得跳过 None。
+        non_empty = [s for s in self._sessions if s is not None]
+        state = _dominant_state(non_empty)
 
         # Logo 动画状态
         if state != self._logo_state:
@@ -522,17 +534,18 @@ class DisplayRenderer:
             self._logo_state = state
             self._logo_frame = 0
 
-        # session 圆点
+        # session 圆点：按 slot 直接取，空槽显示 IDLE 色
         for i, dot in enumerate(self._session_dots):
-            s = _sess_state(self._sessions[i]) if i < len(self._sessions) else S_IDLE
+            sess = self._sessions[i] if i < len(self._sessions) else None
+            s = _sess_state(sess) if sess is not None else S_IDLE
             dot.set_style_bg_color(_DOT_COLORS[s], lv.PART.MAIN)
 
-        # 消息块：取优先级最高的 session
+        # 消息块：取优先级最高的 session（按 slot 顺序找第一个匹配优先级的）
         active_sess = None
         active_idx  = 0
         for priority in (S_ERROR, S_WORKING, S_DONE, S_IDLE):
             for i, s in enumerate(self._sessions):
-                if _sess_state(s) == priority:
+                if s is not None and _sess_state(s) == priority:
                     active_sess = s
                     active_idx  = i + 1
                     break

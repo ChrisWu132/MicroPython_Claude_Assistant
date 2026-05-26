@@ -58,6 +58,9 @@ class _MockTransport:
 
 def _reset():
     d._sessions.clear()
+    # v6 关键：清 slot_assignments，否则跨测试会污染（其它测试共用 module-level state）
+    for i in range(len(d._slot_assignments)):
+        d._slot_assignments[i] = None
     d._dirty = False
     d._stub = True
     d._last_pushed_wire = None
@@ -84,29 +87,39 @@ def _env_stop(sid, cwd):
                         "permission_mode": "auto"}}
 
 
-# ── 设备端最小模拟（照搬 display_renderer.py:566-581） ──
+# ── 设备端最小模拟（照搬 display_renderer.py:566-581 + v6 slot 派发） ──
 class _FakeDevice:
-    """模拟 ESP32 panel 的 _slot_names / _histories 行为，只看会不会误清。"""
-    def __init__(self):
+    """模拟 ESP32 panel 的 _slot_names / _histories 行为，看会不会误清。
+
+    slot_mode='index'：v5 老固件路径，按数组下标渲染（用于演示 bug 仍在）
+    slot_mode='slot' ：v6 新固件路径，按 wire entry 的 slot 字段渲染（修复后）
+    """
+    def __init__(self, slot_mode="slot"):
+        self.slot_mode = slot_mode
         self.slot_names = [""] * MAX_SESSIONS
         self.histories = [[f"<initial-history-slot-{i}>"] for i in range(MAX_SESSIONS)]
-        self.clear_events = []  # list of (slot_index, old_name, new_name)
+        self.clear_events = []
 
     def render(self, wire):
-        """照搬 display_renderer.render() 的核心逻辑。"""
-        sessions = wire.get("ss", [])[:MAX_SESSIONS]
+        sessions = wire.get("ss", [])
+        slot_table = [None] * MAX_SESSIONS
+        if self.slot_mode == "slot":
+            for s in sessions:
+                slot = s.get("slot", -1)
+                if 0 <= slot < MAX_SESSIONS:
+                    slot_table[slot] = s
+        else:  # index 模式
+            for i, s in enumerate(sessions[:MAX_SESSIONS]):
+                slot_table[i] = s
         for i in range(MAX_SESSIONS):
-            sess = sessions[i] if i < len(sessions) else None
-            self._update_tab(i, sess)
+            self._update_tab(i, slot_table[i])
 
     def _update_tab(self, index, sess):
         if sess is None:
-            # 空槽分支：只清 slot_names，不清 history（见 :573）
             self.slot_names[index] = ""
             return
         new_name = sess.get("n", "")
         if new_name != self.slot_names[index]:
-            # 关键路径：name 变 → 清 history（见 :577-580）
             old_name = self.slot_names[index]
             old_history = list(self.histories[index])
             self.histories[index] = []
@@ -132,7 +145,7 @@ async def test_session_slot_drift_after_cleanup():
       实际：A 跑到 S2 槽
     """
     _reset()
-    device = _FakeDevice()
+    device = _FakeDevice(slot_mode="slot")  # v6：按 slot 字段渲染
     last = None
 
     def _accum_history(label):
@@ -201,29 +214,51 @@ async def test_session_slot_drift_after_cleanup():
     print(f"  device.slot_names = {device.slot_names}")
     print(f"  device.histories  = {device.histories[:2]}")
 
+    # ── slot 稳定性断言（v6 修复要点）──
+    # 取每个 wire 里 projA 对应 entry 的 slot 字段，跨 cleanup→重连应保持一致
+    def _slot_of(wire, name):
+        for s in wire["ss"]:
+            if s.get("n") == name:
+                return s.get("slot")
+        return None
+
+    slot_A_w1 = _slot_of(wire1, "projA")
+    slot_A_w4 = _slot_of(wire4, "projA")
+    slot_B_w1 = _slot_of(wire1, "projB")
+    slot_B_w4 = _slot_of(wire4, "projB")
     names_w4 = [s.get("n") for s in wire4["ss"]]
-    print(f"\n=== bug 证据 ===")
-    print(f"初始顺序  : {names_w1}")
-    print(f"A 重连后  : {names_w4}")
-    print(f"history 被误清次数: {len(device.clear_events)}")
+    print(f"\n=== v6 修复验证 ===")
+    print(f"初始 wire 顺序 : {[s.get('n') for s in wire1['ss']]}")
+    print(f"A 重连后顺序   : {names_w4}（数组顺序可不一致——device 按 slot 渲染）")
+    print(f"projA: slot {slot_A_w1} → {slot_A_w4}（必须一致）")
+    print(f"projB: slot {slot_B_w1} → {slot_B_w4}（必须一致）")
+    print(f"history clear 事件: {len(device.clear_events)} 次")
     for ev in device.clear_events:
         print(f"  slot={ev['slot']}  {ev['old_name']!r} → {ev['new_name']!r}  "
               f"cleared {len(ev['cleared_history'])} items")
 
-    # ── 断言（修复前必失败）──
-    assert names_w4 == ["projA", "projB"], (
-        f"BUG 复现：A 应回到 slot 0，但 wire 顺序变成 {names_w4}"
+    # 断言 1：wire entry 必须带 slot 字段（v6 协议契约）
+    for s in wire1["ss"] + wire4["ss"]:
+        assert "slot" in s, f"v6 wire entry missing slot field: {s}"
+        assert isinstance(s["slot"], int) and s["slot"] >= 0, f"invalid slot: {s}"
+
+    # 断言 2：projA / projB 的 slot 跨 cleanup→重连必须保持稳定
+    assert slot_A_w1 == slot_A_w4, (
+        f"projA slot 漂移：{slot_A_w1} → {slot_A_w4}（v6 应保持稳定）"
     )
-    # device 端：理想情况只有"A 从空槽变 projA"这一次 clear（步骤 ①, ⑤）
-    # 实际：会多出 projA→projB / projB→projA 这种 swap clear
+    assert slot_B_w1 == slot_B_w4, (
+        f"projB slot 漂移：{slot_B_w1} → {slot_B_w4}"
+    )
+
+    # 断言 3：device 端按 slot 渲染时不应发生 name swap clear
     unexpected_clears = [
         ev for ev in device.clear_events
         if ev["old_name"] and ev["new_name"] and ev["old_name"] != ev["new_name"]
     ]
     assert not unexpected_clears, (
-        f"BUG 复现：device 端发生 name 互换清历史 ×{len(unexpected_clears)}：{unexpected_clears}"
+        f"device 端发生 name 互换清历史 ×{len(unexpected_clears)}：{unexpected_clears}"
     )
-    print("  ok  slot 稳定 + 历史无误清")
+    print("  ok  v6 修复：slot 稳定 + 历史无误清")
 
 
 async def main():

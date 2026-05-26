@@ -27,10 +27,19 @@ from state import S_IDLE, S_WORKING, S_PENDING, S_DONE, S_ERROR
 
 
 class SessionStatus:
-    """v5 wire 中单个 session 的状态（从 s 字段推导所有属性）。"""
+    """v5 wire 中单个 session 的状态（从 s 字段推导所有属性）。
+
+    v6 新增 slot 字段：device 端按 slot 渲染、不再依赖 ss 数组下标。
+    daemon 维护 sid→slot 持久映射，让 session 删除-重连前后 slot 保持稳定，
+    避免 v5 协议下 ss 数组顺序变化导致的 tab 漂移和 history 误清（issue #6）。
+
+    slot 默认 -1 兼容老 daemon（无 slot 字段时）：renderer 端把 -1 视为
+    溢出/不显示，不再走 enumerate fallback——v6 起 daemon 总是输出真实 slot。
+    """
     def __init__(self, d: dict):
         s = d.get("s", S_IDLE)
         self.name        = d.get("n", "?")
+        self.slot        = d.get("slot", -1)
         self.running     = 1 if s == S_WORKING else 0
         self.waiting     = 1 if s == S_PENDING else 0
         self.completed   = s == S_DONE

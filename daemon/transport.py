@@ -185,7 +185,75 @@ class BleTransport(Transport):
     # ── 连接循环结束 ─────────────────────────────────────────
 
 
-# ── WiFi 实现（预留） ─────────────────────────────────────────
+# ── TCP fanout 实现 ───────────────────────────────────────────
+
+class TcpFanoutTransport(Transport):
+    """TCP fanout：listen 127.0.0.1:port，accept 多 client，send() 把
+    ``json.dumps(payload)+"\n"`` 广播给所有已连接 client。
+
+    用途：PC 端跑多个虚拟设备脚本接 wire JSON 做无硬件长测，与 BleTransport
+    并存。``connected()`` 在无 client 时返 False，``send()`` 在无 client 时
+    无操作不抛——确保不污染 BLE 的重连补发 dedup 语义。
+    """
+
+    def __init__(self, host: str = "127.0.0.1", port: int = 57321):
+        self._host = host
+        self._port = port
+        self._clients: set = set()
+        self._server = None
+        self._on_connect = None
+        self._on_disconnect = None
+
+    async def start(self, on_recv, on_connect, on_disconnect):
+        self._on_connect = on_connect
+        self._on_disconnect = on_disconnect
+        self._server = await asyncio.start_server(self._handle_client, self._host, self._port)
+        print(f"[tcp-fanout] listening on {self._host}:{self._port}")
+        async with self._server:
+            await self._server.serve_forever()
+
+    async def _handle_client(self, reader, writer):
+        peer = writer.get_extra_info("peername")
+        self._clients.add(writer)
+        print(f"[tcp-fanout] client connected: {peer} (total={len(self._clients)})")
+        if self._on_connect:
+            self._on_connect()
+        try:
+            await reader.read()
+        finally:
+            self._clients.discard(writer)
+            try:
+                writer.close()
+                await writer.wait_closed()
+            except Exception:
+                pass
+            print(f"[tcp-fanout] client disconnected: {peer} (total={len(self._clients)})")
+            if self._on_disconnect:
+                self._on_disconnect()
+
+    async def send(self, payload: dict):
+        if not self._clients:
+            return
+        data = (json.dumps(payload) + "\n").encode()
+        dead = []
+        for w in list(self._clients):
+            try:
+                w.write(data)
+                await w.drain()
+            except Exception as e:
+                dead.append(w)
+                print(f"[tcp-fanout] write failed, dropping: {e}")
+        for w in dead:
+            self._clients.discard(w)
+
+    def connected(self) -> bool:
+        return bool(self._clients)
+
+    def device_online(self) -> bool:
+        return self.connected()
+
+
+# ── WiFi 实现（预留：设备端 WiFi 连接，区别于 TcpFanoutTransport 的 fanout 用途） ─
 
 class WifiTransport(Transport):
     """TCP socket 传输（未实现）。"""
